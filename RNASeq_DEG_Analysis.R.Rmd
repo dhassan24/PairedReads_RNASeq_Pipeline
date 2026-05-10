@@ -1,0 +1,557 @@
+---
+title: "Bulk RNA-seq Differential Expression Analysis"
+subtitle: "T. tenax Exposure in NCI-H292 Human Lung Epithelial Cells"
+author: "Danya Hassan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+---
+
+## 1. Overview
+
+This notebook performs a complete bulk RNA-seq differential expression analysis
+comparing human lung epithelial cells (NCI-H292) exposed to *Trichomonas tenax*
+(*T. tenax*) protozoan against untreated controls (n = 3 per group).
+
+**Upstream pipeline:** Raw FASTQ files were quality-trimmed, aligned to the
+human reference genome (hg38) using HISAT2, and quantified with featureCounts
+to produce the raw counts matrix used here.
+
+**Analysis steps:**
+
+1. Data loading and quality filtering  
+2. DESeq2 normalization and DE analysis (with LFC shrinkage)  
+3. QC visualizations (size factors, dispersion, PCA)  
+4. Volcano plot and MA plot  
+5. Gene ontology (GO Biological Process)  
+6. KEGG pathway enrichment  
+7. g:Profiler (GOST) multi-ontology enrichment  
+8. Heatmap of top DE genes  
+9. Pathway network visualization (cnetplot)
+
+---
+
+## 2. Libraries
+
+```{r libraries}
+# Bioconductor
+library(DESeq2)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(biomaRt)
+library(ComplexHeatmap)
+
+# CRAN
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(gprofiler2)
+library(circlize)
+library(tibble)
+library(plotly)
+library(RColorBrewer)
+```
+
+---
+
+## 3. Load Data
+
+```{r load-data}
+# ── Edit paths here ──────────────────────────────────────────────────────────
+COUNTS_PATH   <- "dh_counts_project.txt"
+METADATA_PATH <- "dh_counts_project_metadata.csv"
+# ─────────────────────────────────────────────────────────────────────────────
+
+counts <- read.delim(
+  COUNTS_PATH,
+  comment.char    = "#",
+  stringsAsFactors = FALSE,
+  row.names        = 1
+)
+
+metadata <- read.csv(METADATA_PATH, stringsAsFactors = FALSE)
+
+cat("Counts matrix dimensions:", nrow(counts), "genes ×", ncol(counts), "columns\n")
+cat("Metadata rows           :", nrow(metadata), "\n")
+```
+
+---
+
+## 4. Data Wrangling
+
+### 4.1 Clean Counts Matrix
+
+```{r clean-counts}
+counts_clean <- counts %>%
+  dplyr::select(-c(Chr, Start, End, Strand, Length)) %>%
+  dplyr::rename(
+    SRR23972383 = TT_Cultured_01.sam,
+    SRR23972384 = TT_Cultured_02.sam,
+    SRR23972385 = TT_Cultured_03.sam,
+    SRR23972386 = Untreated_01.sam,
+    SRR23972387 = Untreated_02.sam,
+    SRR23972388 = Untreated_03.sam
+  )
+
+cat("Cleaned counts matrix:", nrow(counts_clean), "genes ×",
+    ncol(counts_clean), "samples\n")
+head(counts_clean, 3)
+```
+
+### 4.2 Format Sample Metadata
+
+```{r clean-metadata}
+sample_info <- metadata %>%
+  dplyr::select(-geo_id) %>%
+  dplyr::rename(ttenax = dex) %>%
+  as.data.frame()
+
+rownames(sample_info) <- sample_info$id
+sample_info <- sample_info %>% dplyr::select(-id)
+
+# Set factor levels explicitly: control as reference
+sample_info$ttenax <- factor(sample_info$ttenax,
+                             levels = c("control", "treated"))
+
+sample_info
+```
+
+---
+
+## 5. DESeq2 Analysis
+
+### 5.1 Build DESeqDataSet and Filter
+
+```{r deseq-build}
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_clean,
+  colData   = sample_info,
+  design    = ~ ttenax
+)
+
+# Keep genes with > 10 total counts across all samples
+dds_filtered <- dds[rowSums(counts(dds)) > 10, ]
+
+cat("Genes before filtering:", nrow(dds), "\n")
+cat("Genes after filtering :", nrow(dds_filtered), "\n")
+```
+
+### 5.2 Run DESeq2
+
+```{r deseq-run}
+dds_seq <- DESeq(dds_filtered)
+```
+
+### 5.3 Results with LFC Shrinkage
+
+LFC shrinkage (apeglm method) reduces noise on low-count genes without
+discarding them, producing more reliable fold-change estimates for ranking
+and visualization.
+
+```{r deseq-results}
+# Raw results
+res_raw <- results(dds_seq, alpha = 0.05,
+                   contrast = c("ttenax", "treated", "control"))
+
+# Shrunk LFC (recommended for visualization and ranking)
+res_shrunk <- lfcShrink(dds_seq,
+                         coef  = "ttenax_treated_vs_control",
+                         type  = "apeglm",
+                         res   = res_raw)
+
+# Add gene symbols
+res_df <- as.data.frame(res_shrunk)
+res_df$symbol <- mapIds(
+  org.Hs.eg.db,
+  keys     = rownames(res_df),
+  keytype  = "ENSEMBL",
+  column   = "SYMBOL",
+  multiVals = "first"
+)
+
+cat("Total tested genes    :", nrow(res_df), "\n")
+cat("Significant (padj<0.05):", sum(res_df$padj < 0.05, na.rm = TRUE), "\n")
+cat("Upregulated (LFC>1)   :",
+    sum(res_df$padj < 0.05 & res_df$log2FoldChange > 1, na.rm = TRUE), "\n")
+cat("Downregulated (LFC<-1):",
+    sum(res_df$padj < 0.05 & res_df$log2FoldChange < -1, na.rm = TRUE), "\n")
+```
+
+---
+
+## 6. QC Visualizations
+
+### 6.1 Size Factor Check
+
+Size factors close to 1.0 indicate similar sequencing depths across samples.
+Large deviations (> 2×) may suggest normalization issues.
+
+```{r size-factors}
+sf_df <- data.frame(
+  sample      = colnames(dds_seq),
+  size_factor = sizeFactors(dds_seq),
+  condition   = sample_info$ttenax
+)
+
+ggplot(sf_df, aes(x = sample, y = size_factor, fill = condition)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "DESeq2 Size Factors per Sample",
+       x = NULL, y = "Size Factor", fill = "Condition") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### 6.2 Dispersion Estimates
+
+A well-fitted dispersion trend (red curve) that follows the gene-wise estimates
+(black dots) closely is expected. Outliers (circled) are genes with unusually
+high variability.
+
+```{r dispersion}
+plotDispEsts(dds_seq,
+             main = "Dispersion Estimates — T. tenax vs Control")
+```
+
+### 6.3 PCA — 2D (ggplot2)
+
+```{r pca-2d}
+vsd <- vst(dds_seq, blind = TRUE)
+
+pca_data <- plotPCA(vsd, intgroup = "ttenax", returnData = TRUE)
+var_exp  <- round(100 * attr(pca_data, "percentVar"), 1)
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = ttenax, label = name)) +
+  geom_point(size = 5, alpha = 0.9) +
+  geom_text_repel(size = 3.5, show.legend = FALSE) +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    title = "PCA of VST-Normalized Counts",
+    x     = paste0("PC1 (", var_exp[1], "% variance)"),
+    y     = paste0("PC2 (", var_exp[2], "% variance)"),
+    color = "Condition"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+### 6.4 PCA — 3D (Plotly)
+
+```{r pca-3d}
+counts_labeled <- counts_clean %>%
+  dplyr::rename(
+    "T-Tenax Treated 1" = SRR23972383,
+    "T-Tenax Treated 2" = SRR23972384,
+    "T-Tenax Treated 3" = SRR23972385,
+    "Untreated 1"        = SRR23972386,
+    "Untreated 2"        = SRR23972387,
+    "Untreated 3"        = SRR23972388
+  )
+
+pca_3d     <- prcomp(t(counts_labeled), retx = TRUE)
+pca_3d_df  <- as.data.frame(pca_3d$x[, 1:3])
+pca_3d_df$Sample    <- rownames(pca_3d_df)
+pca_3d_df$Condition <- ifelse(
+  grepl("T-Tenax", pca_3d_df$Sample), "Treated", "Untreated"
+)
+
+plot_ly(
+  pca_3d_df,
+  x = ~PC1, y = ~PC2, z = ~PC3,
+  type   = "scatter3d",
+  mode   = "markers",
+  color  = ~Condition,
+  colors = c("Treated" = "steelblue", "Untreated" = "seagreen"),
+  text   = ~Sample,
+  marker = list(size = 7)
+) %>%
+  layout(title = "3D PCA — T. tenax Treated vs Untreated")
+```
+
+---
+
+## 7. Differential Expression Plots
+
+### 7.1 Volcano Plot
+
+```{r volcano}
+EnhancedVolcano(
+  res_df,
+  lab        = res_df$symbol,
+  x          = "log2FoldChange",
+  y          = "pvalue",
+  title      = "T. tenax Treated vs Untreated — NCI-H292 Cells",
+  subtitle   = "Shrunk LFC | padj < 0.05 | |LFC| > 1",
+  pCutoff    = 0.05,
+  FCcutoff   = 1.0,
+  pointSize  = 2.5,
+  labSize    = 3.5,
+  colAlpha   = 0.6,
+  legendPosition = "right",
+  drawConnectors = TRUE,
+  widthConnectors = 0.4
+)
+```
+
+### 7.2 MA Plot
+
+The MA plot displays log-fold change (M) against mean expression (A). After
+LFC shrinkage, low-count genes (open circles) have their extreme folds pulled
+toward zero, reducing false positives.
+
+```{r ma-plot}
+plotMA(res_shrunk,
+       main  = "MA Plot — Shrunk LFC (apeglm)",
+       ylim  = c(-5, 5),
+       alpha = 0.05,
+       colSig = "steelblue",
+       colNonSig = "gray70")
+abline(h = c(-1, 1), lty = 2, col = "crimson", lwd = 1.2)
+```
+
+---
+
+## 8. Functional Enrichment
+
+```{r sig-genes}
+sig_df <- res_df %>%
+  filter(padj < 0.05, !is.na(padj))
+
+upreg_df <- sig_df %>% filter(log2FoldChange >  1.0)
+dwreg_df <- sig_df %>% filter(log2FoldChange < -1.0)
+
+cat("Significant upregulated genes  :", nrow(upreg_df), "\n")
+cat("Significant downregulated genes:", nrow(dwreg_df), "\n")
+```
+
+### 8.1 GO Biological Process — Upregulated Genes
+
+```{r go-upreg}
+upreg_clean <- upreg_df %>% filter(baseMean > 100)
+
+go_upreg <- enrichGO(
+  gene          = rownames(upreg_clean),
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+barplot(go_upreg, showCategory = 12) +
+  ggtitle("GO Biological Process — Upregulated Genes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12))
+```
+
+### 8.2 GO Biological Process — Downregulated Genes
+
+```{r go-dwreg}
+dwreg_clean <- dwreg_df %>% filter(baseMean > 100)
+
+go_dwreg <- enrichGO(
+  gene          = rownames(dwreg_clean),
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+if (!is.null(go_dwreg) && nrow(go_dwreg) > 0) {
+  barplot(go_dwreg, showCategory = 12) +
+    ggtitle("GO Biological Process — Downregulated Genes") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12))
+} else {
+  cat("No significant GO BP terms found for downregulated genes.\n")
+}
+```
+
+### 8.3 KEGG Pathway Enrichment — Upregulated Genes
+
+```{r kegg-upreg}
+upreg_entrez <- bitr(
+  rownames(upreg_clean),
+  fromType = "ENSEMBL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+kegg_upreg <- enrichKEGG(
+  gene         = upreg_entrez$ENTREZID,
+  organism     = "hsa",
+  keyType      = "ncbi-geneid",
+  pvalueCutoff = 0.05
+)
+
+dotplot(kegg_upreg, showCategory = 15) +
+  ggtitle("KEGG Pathway Enrichment — Upregulated Genes") +
+  theme(plot.title = element_text(hjust = 0.5, size = 12))
+```
+
+### 8.4 Pathway Network Plot (cnetplot)
+
+The cnetplot links enriched pathways (larger nodes) to their constituent genes
+(smaller nodes), revealing shared genes across pathways.
+
+```{r cnetplot, fig.width=10, fig.height=8}
+# Convert ENSEMBL to symbol for readable labels
+gene_lfc <- upreg_clean$log2FoldChange
+names(gene_lfc) <- upreg_entrez$ENTREZID[
+  match(rownames(upreg_clean), upreg_entrez$ENSEMBL)
+]
+gene_lfc <- na.omit(gene_lfc)
+
+cnetplot(
+  kegg_upreg,
+  foldChange   = gene_lfc,
+  showCategory = 6,
+  circular     = FALSE,
+  colorEdge    = TRUE
+) +
+  ggtitle("KEGG Pathway Network — Upregulated Genes") +
+  scale_color_gradient2(
+    low  = "steelblue",
+    mid  = "white",
+    high = "firebrick",
+    midpoint = 0,
+    name = "LFC"
+  )
+```
+
+### 8.5 g:Profiler (GOST) — Upregulated Genes
+
+```{r gost-upreg}
+upreg_gost_genes <- sig_df %>%
+  filter(log2FoldChange > 1.5, baseMean > 100) %>%
+  rownames()
+
+gost_upreg <- gost(upreg_gost_genes, organism = "hsapiens", significant = TRUE)
+
+gostplot(gost_upreg, capped = TRUE, interactive = TRUE)
+```
+
+### 8.6 g:Profiler (GOST) — Downregulated Genes
+
+```{r gost-dwreg}
+dwreg_gost_genes <- sig_df %>%
+  filter(log2FoldChange < -1.0, baseMean > 100) %>%
+  rownames()
+
+if (length(dwreg_gost_genes) > 0) {
+  gost_dwreg <- gost(dwreg_gost_genes, organism = "hsapiens", significant = TRUE)
+  gostplot(gost_dwreg, interactive = TRUE)
+} else {
+  cat("No downregulated genes met the filter criteria for GOST analysis.\n")
+}
+```
+
+---
+
+## 9. Heatmap of Top Differentially Expressed Genes
+
+Z-score normalized expression across all six samples. Rows are clustered by
+expression pattern; columns are clustered by sample similarity.
+
+```{r heatmap, fig.width=9, fig.height=8}
+heatmap_genes <- sig_df %>%
+  filter(baseMean > 220, abs(log2FoldChange) > 1.3)
+
+heatmap_counts <- counts(dds_seq, normalized = TRUE)[rownames(heatmap_genes), ]
+
+# Z-score per gene
+heatmap_z <- t(apply(heatmap_counts, 1, scale))
+colnames(heatmap_z) <- c(
+  "T-Tenax 1", "T-Tenax 2", "T-Tenax 3",
+  "Untreated 1", "Untreated 2", "Untreated 3"
+)
+
+# Condition annotation bar
+col_anno <- HeatmapAnnotation(
+  Condition = c(rep("Treated", 3), rep("Untreated", 3)),
+  col = list(Condition = c("Treated" = "steelblue", "Untreated" = "seagreen")),
+  annotation_name_side = "left"
+)
+
+colors_heatmap <- colorRamp2(
+  breaks = c(-2, 0, 2),
+  colors = c("steelblue", "white", "firebrick")
+)
+
+Heatmap(
+  heatmap_z,
+  name              = "z-score",
+  col               = colors_heatmap,
+  top_annotation    = col_anno,
+  cluster_rows      = TRUE,
+  cluster_columns   = TRUE,
+  show_row_dend     = TRUE,
+  show_column_dend  = TRUE,
+  row_labels        = heatmap_genes[rownames(heatmap_z), ]$symbol,
+  row_names_gp      = gpar(fontsize = 7),
+  column_names_gp   = gpar(fontsize = 10),
+  border            = TRUE,
+  column_title      = "Top DE Genes — T. tenax Treated vs Untreated (Z-score)",
+  column_title_gp   = gpar(fontsize = 12, fontface = "bold")
+)
+```
+
+---
+
+## 10. Export Results
+
+```{r export}
+# Full DE results table
+write.csv(
+  res_df %>% arrange(padj),
+  file      = "DEG_results_all.csv",
+  row.names = TRUE
+)
+
+# Significant genes only
+write.csv(
+  sig_df %>% arrange(padj),
+  file      = "DEG_results_significant.csv",
+  row.names = TRUE
+)
+
+cat("Exported:\n")
+cat("  DEG_results_all.csv         —", nrow(res_df), "genes\n")
+cat("  DEG_results_significant.csv —", nrow(sig_df), "genes\n")
+```
+
+---
+
+## 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```
